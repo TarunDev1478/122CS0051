@@ -25,87 +25,105 @@ class AnalyticsService {
             postCommentCounts: new Map(),
             lastUpdated: new Date(0)
         };
+        // Configure axios instance to match Postman
         this.axiosInstance = axios_1.default.create({
-            baseURL: BASE_URL
+            baseURL: BASE_URL,
+            headers: {
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/json'
+            },
+            timeout: 10000
         });
     }
     async authenticate() {
         try {
-            const response = await axios_1.default.post(`${BASE_URL}/auth`, this.authCredentials);
-            this.authToken = response.data.access_token;
-            // Update axios instance with the auth token
-            this.axiosInstance = axios_1.default.create({
-                baseURL: BASE_URL,
-                headers: {
-                    'Authorization': `Bearer ${this.authToken}`
-                }
-            });
-        }
-        catch (error) {
-            console.error('Authentication failed:', error);
-            throw new Error('Failed to authenticate with the API');
-        }
-    }
-    async fetchWithAuth(url) {
-        if (!this.authToken) {
-            await this.authenticate();
-        }
-        try {
-            const response = await this.axiosInstance.get(url);
-            return response.data;
-        }
-        catch (error) {
-            if (axios_1.default.isAxiosError(error) && error.response?.status === 401) {
-                // Token might be expired, try to re-authenticate
-                await this.authenticate();
-                const retryResponse = await this.axiosInstance.get(url);
-                return retryResponse.data;
+            // Best practice is to let Axios handle the Content-Length
+            // Manual setting can cause issues and is usually unnecessary
+            const response = await this.axiosInstance.post('/auth', this.authCredentials);
+            // Check if response and data exist before attempting to access properties
+            if (response && response.data && response.data.access_token) {
+                this.authToken = response.data.access_token;
+                console.log(this.authToken);
+                // Set the token for future requests
+                this.axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${this.authToken}`;
+                // Log truncated token for debugging (avoid logging full tokens in production)
+                console.log('Auth successful. Token:', this.authToken?.slice(0, 10) + '...');
             }
-            console.error(`Error fetching ${url}:`, error);
+            else {
+                throw new Error('Invalid authentication response structure');
+            }
+        }
+        catch (error) {
+            // More detailed error handling
+            if (axios_1.default.isAxiosError(error)) {
+                console.error('Auth failed:', {
+                    status: error.response?.status,
+                    statusText: error.response?.statusText,
+                    data: error.response?.data
+                });
+            }
+            else {
+                console.error('Auth failed with non-Axios error:', error);
+            }
             throw error;
         }
     }
-    async fetchUsers() {
-        const response = await this.fetchWithAuth('/users');
-        return Object.entries(response.users).map(([id, name]) => ({
-            id: parseInt(id),
-            name
-        }));
-    }
-    async fetchPosts(userId) {
-        const response = await this.fetchWithAuth(`/users/${userId}/posts`);
-        return response.posts.map(post => ({
-            ...post,
-            userId // Ensure userId is set correctly
-        }));
-    }
-    async fetchComments(postId) {
-        const response = await this.fetchWithAuth(`/posts/${postId}/comments`);
-        return response.comments.map(comment => ({
-            ...comment,
-            postId // Ensure postId is set correctly
-        }));
+    async makeRequest(method, url, data) {
+        try {
+            const config = {
+                headers: {
+                    'Authorization': `Bearer ${this.authToken}`,
+                    'Content-Type': 'application/json'
+                }
+            };
+            const response = await this.axiosInstance.request({
+                method,
+                url,
+                data,
+                ...config
+            });
+            return response.data;
+        }
+        catch (error) {
+            if (axios_1.default.isAxiosError(error)) {
+                console.error(`Request to ${url} failed:`, {
+                    status: error.response?.status,
+                    data: error.response?.data,
+                    headers: error.response?.headers
+                });
+            }
+            throw error;
+        }
     }
     async updateCache() {
         try {
-            // First ensure we're authenticated
+            // First authenticate
             await this.authenticate();
-            // Clear previous data
-            this.cache.users.clear();
-            this.cache.posts.clear();
-            this.cache.comments.clear();
-            this.cache.userCommentCounts.clear();
-            this.cache.postCommentCounts.clear();
-            // Fetch all users
-            const users = await this.fetchUsers();
-            users.forEach(user => this.cache.users.set(user.id, user));
+            // Clear old data
+            this.cache = {
+                users: new Map(),
+                posts: new Map(),
+                comments: new Map(),
+                userCommentCounts: new Map(),
+                postCommentCounts: new Map(),
+                lastUpdated: new Date()
+            };
+            // Fetch users (match Postman exactly)
+            const usersResponse = await this.makeRequest('get', '/users');
+            const users = Object.entries(usersResponse.users).map(([id, name]) => ({
+                id: parseInt(id),
+                name
+            }));
             // Fetch posts for each user
-            const userPostsPromises = users.map(user => this.fetchPosts(user.id));
-            const allPosts = (await Promise.all(userPostsPromises)).flat();
-            allPosts.forEach(post => this.cache.posts.set(post.id, post));
+            const postsPromises = users.map(user => this.makeRequest('get', `/users/${user.id}/posts`));
+            const allPosts = (await Promise.all(postsPromises))
+                .flatMap(response => response.posts);
             // Fetch comments for each post
-            const postCommentsPromises = allPosts.map(post => this.fetchComments(post.id));
-            const allComments = (await Promise.all(postCommentsPromises)).flat();
+            const commentsPromises = allPosts.map(post => this.makeRequest('get', `/posts/${post.id}/comments`));
+            const allComments = (await Promise.all(commentsPromises))
+                .flatMap(response => response.comments);
             // Group comments by post
             const commentsByPost = new Map();
             allComments.forEach(comment => {
